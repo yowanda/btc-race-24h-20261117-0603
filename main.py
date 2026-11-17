@@ -1,35 +1,48 @@
-# SPDX-License-Identifier: MIT
-"""v5 — oversold bounce: deep 4-hour drawdown + 60-bar breakout.
+"""BTC race bot -- Elder Triple Screen, 720 / 240 / 60 (v4).
 
-Long-only, one position, full size. Pure function of bar closes,
-integer math only — deterministic, no clock, no network, no files,
-no randomness.
+Long only, one position, full size. A long is opened only when all three
+screens agree; once in, a trailing stop and a trend-break backstop guard
+the trade. Pure function of bar closes, integer math only: deterministic,
+no clock, no network, no randomness, no files.
 
-Entry — arm AND trigger must hold on the SAME bar (per-bar arm,
-no latch: a washout printed hours ago does not keep the trade
-armed once price has recovered):
-  * Arm: close at least 2% below the highest close of the last
-    240 bars (4 hours). 2% is ~8x the ~26 bps round-trip cost and
-    ~1/4 of a volatile day's range — a genuine washout, not noise.
-  * Trigger: close breaks above the highest close of the previous
-    60 bars (1-hour Donchian high). Confirms the turn at the START
-    of the recovery.
-Exit — trailing stop only:
-  * Sell when the close falls 0.3% below the highest close since
-    entry. Locks the bounce's gain as it develops, cuts promptly
-    when it fades.
-  * NO trend-break backstop: the entry is justified by the washout
-    low, not by a 4-hour uptrend — price sits BELOW EMA(240) at
-    entry by construction, so such a backstop would fire at once.
-  * NO take-profit: any TP level that "catches" these bounces
-    would be chosen from the data — fitting, forbidden.
-Size: 100% of cash. Max slippage 100 bps. Warm-up 240 bars.
+Screens (all three must pass on the same bar):
+  1. Tide, 720 min (12 h): the 720-minute return is positive AND the
+     close sits above EMA(720). The day-scale trend itself must be up;
+     a bounce cannot flip a 12-hour return unless it retraces the whole
+     12-hour drop, so this screen keeps the bot out of downtrend days.
+  2. Wave, 240 min (4 h): the 240-minute return is positive AND the
+     close sits above EMA(240). The middle screen, spaced ~3x from the
+     tide and ~4x from the ripple (Elder spacing).
+  3. Ripple, 60 min (1 h): the close breaks above the highest close of
+     the last 60 bars (one-hour Donchian high). The entry trigger: it
+     fires at the start of a leg, not minutes into it.
 
-Re-entry: this version has NO guard against re-entering after a
-trailing-stop exit — if the arm and the breakout still hold on a
-later bar, it buys again. That is the spec as written (§8.2 lists
-no guard); any one-trade-per-washout rule belongs to a later
-version, not to this one.
+Exits (whichever comes first):
+  - Trailing stop: sell when the close falls 0.3% below the highest
+    close printed since entry (about one round-trip cost).
+  - Trend-break backstop: sell when the close falls below EMA(240).
+    The 4-hour trend that justified the entry is gone, so the premise
+    is gone. The trail usually fires first; the backstop covers slow
+    rollovers where price drifts under the trend without a sharp
+    pullback from the peak.
+
+Deliberately absent: no take-profit (any level that "catches" the
+bounces would be chosen from the data itself), no minimum hold (the
+trailing exit does that job), no trend filter besides the screens.
+
+Sizing and costs: 100% of cash on entry, one position max, no
+leverage, max slippage 100 bps. Warm-up is 720 bars: the tide screen
+needs 720 bars of history, so the bot cannot trade the first 12 hours
+of a 24-hour window. On a genuine uptrend day the tide gate opens in
+the second half and the breakout fires on new highs; on a downtrend
+or chop day the bot takes zero trades and stands aside at $0 instead
+of bleeding on bull traps.
+
+Replay safety: the bot keeps no state beyond the close list, the two
+EMAs and the peak since entry, all of them rebuilt deterministically
+from the bars themselves. Two runs over the same window therefore
+produce byte-identical action logs. At most one order is ever sent
+per reply, and a sell always empties the whole position.
 """
 
 import os
@@ -38,88 +51,119 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor"))
 import makefun_bars
 
-# --- v5 parameters (set from the cost / range structure, not tuned) ---
-ARM_BARS = 240          # washout lookback, bars
-ARM_DRAWDOWN_BPS = 200  # close must be >= 2% below the 240-bar high
-BREAKOUT_BARS = 60      # Donchian breakout lookback, bars
-TRAIL_BPS = 30          # trailing stop: 0.3% below the peak since entry
-MAX_SLIPPAGE_BPS = 100  # max slippage on every order
-WARMUP_BARS = 240       # bars of history needed before trading
+SYMBOL = "CBBTC"
 
-_BPS = 10_000
+# Screen horizons, in one-minute bars.
+TIDE_BARS = 720
+WAVE_BARS = 240
+BREAKOUT_BARS = 60
 
-# Close history (ints, oldest first) and the running peak since entry.
+# Exit: sell 0.3% (30 bps) below the highest close since entry.
+TRAIL_BPS = 30
+
+MAX_SLIPPAGE_BPS = 100
+
+# No trading until this many closes have been seen: the tide screen
+# needs a close 720 bars back, so the first 12 hours are history only.
+WARMUP_BARS = 720
+
+# Close history, oldest first, ints (the protocol delivers prices as
+# decimal strings; cast once on arrival so every comparison below is
+# integer math).
 _closes = []
+
+# Integer EMAs, seeded with the first close seen and stepped once per
+# bar. Seeding on the first close keeps the EMAs defined from bar one
+# while the 720-bar warm-up builds the history the screens need.
+_ema_tide = None
+_ema_wave = None
+
+# Highest close printed since the current entry filled; None while flat.
+# It is only cleared when the position is actually gone, so a rejected
+# exit order never loses the true peak.
 _peak_since_entry = None
 
 
-def _highest_last(values, count):
-    """Highest value among the last `count` entries of `values`."""
-    best = values[-count]
-    for value in values[-count + 1:]:
-        if value > best:
-            best = value
-    return best
+def _ema_step(ema, close, period):
+    """One integer EMA step: ema += (close - ema) * 2 // (period + 1)."""
+    return ema + (close - ema) * 2 // (period + 1)
+
+
+def _tide_ok(close):
+    """Screen 1: 720-min return > 0 and close above EMA(720)."""
+    ret_tide = close - _closes[-1 - TIDE_BARS]
+    return ret_tide > 0 and close > _ema_tide
+
+
+def _wave_ok(close):
+    """Screen 2: 240-min return > 0 and close above EMA(240)."""
+    ret_wave = close - _closes[-1 - WAVE_BARS]
+    return ret_wave > 0 and close > _ema_wave
+
+
+def _ripple_ok(close):
+    """Screen 3: close breaks above the highest close of the last 60 bars."""
+    prior_high = max(_closes[-1 - BREAKOUT_BARS:-1])
+    return close > prior_high
 
 
 def on_batch(state, batch):
-    global _peak_since_entry
+    global _ema_tide, _ema_wave, _peak_since_entry
 
-    bars = batch.get("bars") or []
-    if not bars:
+    bar = None
+    for candidate in batch.get("bars", []):
+        if candidate.get("symbol") == SYMBOL:
+            bar = candidate
+            break
+    if bar is None:
+        # No bar for our symbol this minute: nothing to decide on.
         return []
-    symbol = bars[0]["symbol"]
-    close = int(bars[0]["c"])
-    if close <= 0:
-        return []
+
+    close = int(bar["c"])
     _closes.append(close)
+    if _ema_tide is None:
+        _ema_tide = close
+        _ema_wave = close
+    else:
+        _ema_tide = _ema_step(_ema_tide, close, TIDE_BARS)
+        _ema_wave = _ema_step(_ema_wave, close, WAVE_BARS)
 
-    # No trading during warm-up, and never before 240 bars of history.
-    if state.warming_up or len(_closes) < WARMUP_BARS:
-        return []
-
-    holding = state.positions.get(symbol)
-
-    if holding is not None:
-        # Track the highest close since entry, then check the trail.
+    holding = state.positions.get(SYMBOL)
+    if holding is not None and holding.qty > 0:
         if _peak_since_entry is None or close > _peak_since_entry:
             _peak_since_entry = close
-        if close * _BPS <= _peak_since_entry * (_BPS - TRAIL_BPS):
-            _peak_since_entry = None
-            return [{
-                "side": "sell",
-                "symbol": symbol,
-                "qty": holding.qty,
-                "max_slippage_bps": MAX_SLIPPAGE_BPS,
-            }]
+        trail_hit = close * 10000 <= _peak_since_entry * (10000 - TRAIL_BPS)
+        backstop_hit = close < _ema_wave
+        if trail_hit or backstop_hit:
+            return [
+                {
+                    "side": "sell",
+                    "symbol": SYMBOL,
+                    "qty": holding.qty,
+                    "max_slippage_bps": MAX_SLIPPAGE_BPS,
+                }
+            ]
         return []
 
-    # Flat: reset the peak tracker, then test arm + trigger on this bar.
     _peak_since_entry = None
-    if len(_closes) < BREAKOUT_BARS + 1:
+
+    if state.warming_up:
+        return []
+    if len(_closes) <= WARMUP_BARS:
+        return []
+    if state.cash <= 0:
         return []
 
-    high_240 = _highest_last(_closes, ARM_BARS)
-    armed = close * _BPS <= high_240 * (_BPS - ARM_DRAWDOWN_BPS)
-    if not armed:
-        return []
-
-    high_60 = _highest_last(_closes[:-1], BREAKOUT_BARS)
-    if close <= high_60:
-        return []
-
-    amount = state.cash
-    room = state.weight_room(symbol)
-    if amount > room:
-        amount = room
-    if amount <= 0:
-        return []
-    return [{
-        "side": "buy",
-        "symbol": symbol,
-        "notional_quote_units": amount,
-        "max_slippage_bps": MAX_SLIPPAGE_BPS,
-    }]
+    if _tide_ok(close) and _wave_ok(close) and _ripple_ok(close):
+        return [
+            {
+                "side": "buy",
+                "symbol": SYMBOL,
+                "notional_quote_units": state.cash,
+                "max_slippage_bps": MAX_SLIPPAGE_BPS,
+            }
+        ]
+    return []
 
 
 makefun_bars.run(on_batch)
